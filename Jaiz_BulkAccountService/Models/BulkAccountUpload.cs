@@ -20,5 +20,7 @@ namespace Jaiz_BulkAccountService.Models
         public string? InitiatorEmail { get; set; }
         public string? RejectionReason { get; set; }
         public string? Instancez { get; set; }
+        public int? CreatedCount { get; set; }
+        public int? UploadedCount { get; set; }
     }
 }

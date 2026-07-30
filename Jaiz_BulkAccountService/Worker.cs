@@ -9,6 +9,7 @@ using System;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Model;
 using static System.Formats.Asn1.AsnWriter;
 
 namespace Jaiz_BulkAccountService
@@ -144,26 +145,56 @@ namespace Jaiz_BulkAccountService
                     {
                         try
                         {
-                            _logger.LogInformation("Processing Tier1 | UploadId={UploadId}, BVN={BVN}", uploadId, account.Bvn);
+                            _logger.LogInformation("Processing Tier1 | UploadId={UploadId}, BVN={BVN}, NIN={NIN}", uploadId, account.Bvn, account.NIN);
 
-                            if (string.IsNullOrWhiteSpace(account.Bvn))
-                                continue;
-
-                            var bvnResponse = GetBVNDetails(account.Bvn);
-                            if (bvnResponse == null)
+                            if (string.IsNullOrWhiteSpace(account.Bvn) && string.IsNullOrWhiteSpace(account.NIN))
                             {
-                                await UpdateFailureReason(account.Bvn, "BVN response is null", "0", uploadId);
                                 continue;
                             }
 
-                            var validation = ValidateBVN(account, bvnResponse);
-                            if (!validation.IsValid)
+                            Models.BVNResponse bvnResponse = null;
+                            NINResponse ninResponse = null;
+                            object identityResponse = null;
+                            bool useBVN = false;
+
+                            // Try BVN first
+                            if (!string.IsNullOrWhiteSpace(account.Bvn))
                             {
-                                await UpdateFailureReason(account.Bvn, validation.Message, validation.Code, uploadId);
+                                bvnResponse = GetBVNDetails(account.Bvn!);
+                                var bvnResult = ValidateBVN(account, bvnResponse);
+
+
+                                if (bvnResult.IsValid)
+                                {
+                                    identityResponse = bvnResponse;
+                                    useBVN = true;
+                                }
+                            }
+
+                            // If BVN failed or was not supplied, try NIN
+                            if (identityResponse == null && !string.IsNullOrWhiteSpace(account.NIN))
+                            {
+                                ninResponse = GetNINDetails(account.NIN!);
+                                var ninResult = ValidateNIN(account, ninResponse);
+
+                                if (ninResult.IsValid)
+                                {
+                                    identityResponse = ninResponse;
+                                    useBVN = false;
+                                }
+                            }
+
+                            // Neither BVN nor NIN validated
+                            if (identityResponse == null)
+                            {
+                                await UpdateFailureReason(!string.IsNullOrWhiteSpace(account.Bvn) ? account.Bvn : account.NIN, "BVN/NIN validation failed.", "1", uploadId);
+
                                 continue;
                             }
 
-                            var request = BuildAccountRequest(account, bvnResponse);
+                            // Build request
+                            var request = useBVN ? BuildAccountRequest(account, bvnResponse) : BuildAccountRequestWithNIN(account, ninResponse);
+
                             var response = await CreateAccountAsync(request, uploadId);
 
                             if (response == null)
@@ -177,13 +208,17 @@ namespace Jaiz_BulkAccountService
 
                             await db.SaveChangesAsync();
 
-                            //await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => x.CreatedCount + 1));
+                            await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => (x.CreatedCount ?? 0) + 1));
+                            await db.SaveChangesAsync();
 
-                            _logger.LogInformation("Tier1 account created | UploadId={UploadId}, BVN={BVN}, AccountNo={AccountNo}", uploadId, account.Bvn, response.accountNo);
+
+                            _logger.LogInformation("Tier1 account created | UploadId={UploadId}, Identifier={Identifier}, AccountNo={AccountNo}", uploadId, useBVN ? account.Bvn : account.NIN, response.accountNo);
                         }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "Tier1 processing error | UploadId={UploadId}, BVN={BVN}", uploadId, account.Bvn);
+                            _logger.LogError(ex,
+                                "Tier1 processing error | UploadId={UploadId}, BVN={BVN}, NIN={NIN}",
+                                uploadId, account.Bvn, account.NIN);
                         }
                     }
                 }
@@ -225,7 +260,7 @@ namespace Jaiz_BulkAccountService
                             var bvnResult = ValidateBVN(account, bvn);
                             if (!bvnResult.IsValid)
                             {
-                                await UpdateFailureReason(account.Bvn!, bvnResult.Message, bvnResult.Code, uploadId);
+                                await UpdateFailureReason(account.Bvn!, bvnResult.Message, "1", uploadId);
                                 continue;
                             }
 
@@ -233,7 +268,7 @@ namespace Jaiz_BulkAccountService
                             var ninResult = ValidateNIN(account, nin);
                             if (!ninResult.IsValid)
                             {
-                                await UpdateFailureReason(account.Bvn, ninResult.Message, ninResult.Code, uploadId);
+                                await UpdateFailureReason(account.Bvn, ninResult.Message, "1", uploadId);
                                 continue;
                             }
 
@@ -253,7 +288,9 @@ namespace Jaiz_BulkAccountService
 
                             await db.SaveChangesAsync();
 
-                            //await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => x.CreatedCount + 1));
+
+                            await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => (x.CreatedCount ?? 0) + 1));
+                            await db.SaveChangesAsync();
 
                             _logger.LogInformation("Savings account created | UploadId={UploadId}, BVN={BVN}, AccountNo={AccountNo}", uploadId, account.Bvn, response.accountNo);
                         }
@@ -267,9 +304,6 @@ namespace Jaiz_BulkAccountService
                 {
                     break;
                 }
-
-
-
             }
         }
 
@@ -304,7 +338,7 @@ namespace Jaiz_BulkAccountService
                             var bvnResponse = GetBVNDetails(account.Bvn);
                             if (bvnResponse == null)
                             {
-                                await UpdateFailureReason(account.Bvn, "BVN response is null", "0", uploadId);
+                                await UpdateFailureReason(account.Bvn, "BVN response is null", "1", uploadId);
 
                                 _logger.LogInformation("BVN response is null | UploadId={UploadId}, BVN={BVN}", uploadId, account.Bvn);
                             }
@@ -367,7 +401,10 @@ namespace Jaiz_BulkAccountService
 
                                     await db.SaveChangesAsync();
 
-                                    //await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => x.CreatedCount + 1));
+
+                                    await db.BulkAccountUpload.Where(x => x.Instancez != "pause" && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters.SetProperty(x => x.CreatedCount, x => (x.CreatedCount ?? 0) + 1));
+                                    await db.SaveChangesAsync();
+
 
                                     _logger.LogInformation("Kids account created | UploadId={UploadId}, BVN={BVN}, AccountNo={AccountNo}", uploadId, account.Bvn, response.accountNo);
 
@@ -389,16 +426,16 @@ namespace Jaiz_BulkAccountService
         }
 
         // ========================= DB HELPERS =========================
-        private async Task UpdateFailureReason(string bvn, string reason, string status, string uploadId)
+        private async Task UpdateFailureReason(string bvnORbvn, string reason, string status, string uploadId)
         {
             using var scope = _scopeFactory.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<BulkAccountSolutionDbContext>();
 
-            await db.BulkAccount.Where(x => x.Bvn == bvn && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters
+            await db.BulkAccount.Where(x => (x.Bvn == bvnORbvn || x.NIN == bvnORbvn) && x.UploadId == uploadId).ExecuteUpdateAsync(setters => setters
                     .SetProperty(x => x.FailureReason, reason)
                     .SetProperty(x => x.Status, status));
 
-            _logger.LogWarning("Account failed | UploadId={UploadId}, BVN={BVN}, Reason={Reason}", uploadId, bvn, reason);
+            _logger.LogError("Account failed | UploadId={UploadId}, BVNorNIN={BVNorNIN}, Reason={Reason}", uploadId, bvnORbvn, reason);
         }
 
         private async Task HandleAccountCreationFailures(string responseContent, string bvn, string uploadID, string glcode)
@@ -408,19 +445,31 @@ namespace Jaiz_BulkAccountService
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<BulkAccountSolutionDbContext>();
 
-                if (responseContent.Contains("Invalid BVN"))
+                if (responseContent.Contains("Account holder must be 18 years and above"))
+                {
+                    await UpdateFailureReason(bvn, "Account holder must be 18 years and above", "6", uploadID);
+                }
+                else if (responseContent.Contains("Invalid BVN"))
                 {
                     await UpdateFailureReason(bvn, "Invalid BVN", "4", uploadID);
+                }
+                else if (responseContent.Contains("BVN Required"))
+                {
+                    await UpdateFailureReason(bvn, "BVN is required for account opening.", "4", uploadID);
                 }
                 else if (responseContent.Contains("Invalid DOB"))
                 {
                     await UpdateFailureReason(bvn, "Account holder must be 18 years and above", "6", uploadID);
                 }
+                else if (responseContent.Contains("Please enter valid integer Number for ID Type"))
+                {
+                    await UpdateFailureReason(bvn, "Please enter a valid integer number for IDType", "1", uploadID);
+                }
                 else if (responseContent.ToUpper().Contains("TIERED"))
                 {
                     var (cif, acct) = await GetAccountOpenedTodayByBVN(bvn, glcode);
 
-                    var account = db.BulkAccount.Where(a => a.Bvn == bvn && a.UploadId == uploadID).FirstOrDefault();
+                    var account = db.BulkAccount.Where(a => (a.Bvn == bvn || a.NIN == bvn) && a.UploadId == uploadID).FirstOrDefault();
                     account.AccountNo = acct;
                     account.Cif = cif;
                     account.Status = "6";
@@ -485,7 +534,7 @@ namespace Jaiz_BulkAccountService
                     }
                     else
                     {
-                        await UpdateFailureReason(bvn, "Unable to create account, try again later.", "0", uploadID);
+                        await UpdateFailureReason(bvn, "Unable to create account, try again later.", "1", uploadID);
                     }
                 }
             }
@@ -524,7 +573,7 @@ namespace Jaiz_BulkAccountService
                         account!.AccountNo = acct;
                         account.Cif = cif;
                         account.Status = "2";
-                        account.FailureReason = "";
+                        account.FailureReason = "Account opened today, see account number and cif";
 
                         await db.SaveChangesAsync();
 
@@ -532,7 +581,7 @@ namespace Jaiz_BulkAccountService
                     }
                     else
                     {
-                        await UpdateFailureReason(request.bvn, "API failure", "0", uploadId);
+                        await UpdateFailureReason(request.bvn, "API failure", "1", uploadId);
                         return null;
                     }
                 }
@@ -541,7 +590,9 @@ namespace Jaiz_BulkAccountService
 
                 if (result?.responseCode != "00")
                 {
-                    await HandleAccountCreationFailures(response.Content!, request.bvn, uploadId, request.glcode);
+                    var ninORbvn = !string.IsNullOrEmpty(request.bvn) ? request.bvn : request.nin;
+
+                    await HandleAccountCreationFailures(response.Content!, ninORbvn, uploadId, request.glcode);
                     return null;
                 }
 
@@ -793,7 +844,6 @@ namespace Jaiz_BulkAccountService
             public static NINValidationResult Failure(string message, string code) =>
                 new NINValidationResult { IsValid = false, Message = message, Code = code };
         }
-
         public async Task<(string, string)> GetAccountOpenedTodayByBVN(string bvn, string glcode)
         {
             var _cif = "";
@@ -872,6 +922,59 @@ namespace Jaiz_BulkAccountService
             return null;
         }
 
+        public AccountOpeningRequest BuildAccountRequestWithNIN(Account account, Models.NINResponse nin)
+        {
+            try
+            {
+                // Default missing fields from BVN if needed
+
+                account.Sex = nin.gender?.ToUpper() == "MALE" ? "M" : "F";
+                account.Title = account.Sex == "M" ? 23 : 24;
+
+                if (string.IsNullOrWhiteSpace(account.MktByID))
+                    account.MktByID = "99999007";
+
+                var dob = DateTime.Parse(nin.birthDate);
+                string formattedDob = dob.ToString("yyyy-MM-dd");
+
+                return new AccountOpeningRequest
+                {
+                    accountName = $"{nin.firstName} {nin.middleName} {nin.surName}",
+                    addref = account.Address,
+                    address = account.Address,
+                    branchcode = account.BranchCode?.ToString(),
+                    cif = "",
+                    curencycode = "566",
+                    secondname = nin.middleName,
+                    firstname = nin.firstName,
+                    lastname = nin.surName,
+                    glcode = account.GlCode,
+                    idtype = account.IDType,
+                    idno = account.IDNumber,
+                    idexpirydate = "9999-01-01",
+                    bvn = account.Bvn,
+                    nin = account.NIN,
+                    marital = "S",
+                    sex = account.Sex,
+                    telephone = account.Phone,
+                    dob = formattedDob,
+                    title = account.Title,
+                    ecosector = "8",
+                    division = 22,
+                    dept = 223,
+                    externalAccountNo = "",
+                    externalPartyCode = "",
+                    marketedbyid = account.MktByID,
+                    marketedforid = account.MktForID,
+                    channel = "BulkAcctSol"
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "BuildAccountRequest error | BVN={BVN}, Message={Message}", nin, ex.Message);
+            }
+            return null;
+        }
         public async Task ProcessUploads()
         {
             try
@@ -879,7 +982,7 @@ namespace Jaiz_BulkAccountService
                 using var scope = _scopeFactory.CreateScope();
                 var db = scope.ServiceProvider.GetRequiredService<BulkAccountSolutionDbContext>();
 
-                var upload = await db.BulkAccountUpload.FirstOrDefaultAsync(x => x.Status == "Approved" && x.Instancez == "10" || x.Status == "Processing" && x.Instancez == "10" || x.Status == "Failed" && x.Instancez == "10");
+                var upload = await db.BulkAccountUpload.FirstOrDefaultAsync(x => x.Status == "Approved" && x.Instancez == "9" || x.Status == "Processing" && x.Instancez == "9" || x.Status == "Failed" && x.Instancez == "9");
                 if (upload != null)
                 {
                     upload.Status = "Processing";
